@@ -7,6 +7,7 @@
 #include "anomaly/i18n.hpp"
 #include "anomaly/platform_ui_layout.hpp"
 #include "anomaly/platform_ui_theme.hpp"
+#include "anomaly/telemetry.hpp"
 #include "anomaly/runtime_launch.hpp"
 #include "anomaly/reliable_storage.hpp"
 #include "anomaly/pak_mod_settings.hpp"
@@ -554,6 +555,10 @@ public:
         worker_.request_stop();
         queue_changed_.notify_all();
         worker_.join();
+        if (telemetry_worker_.joinable()) {
+            telemetry_worker_.request_stop();
+            telemetry_worker_.join();
+        }
         // Closing the window may cancel a queued preference write. Once initialization completed,
         // persist the final in-memory configuration after the worker has stopped.
         if (state_.theme != nullptr) static_cast<void>(PersistConfigurationImpl());
@@ -596,6 +601,7 @@ public:
 
     void InstallProxy() {
         Queue(anomaly::MessageId::LauncherStatusInstallingRuntime, MessageScope::Proxy, [this] {
+            StartTelemetryImpl();
             const auto game = GameDirectory();
             const auto result = anomaly::launcher::InstallProxyRuntime(game, source_);
             PublishProxy(result);
@@ -616,6 +622,7 @@ public:
 
     void UninstallProxy() {
         Queue(anomaly::MessageId::LauncherStatusUninstallingProxy, MessageScope::Proxy, [this] {
+            StartTelemetryImpl();
             const auto result = anomaly::launcher::UninstallProxy(GameDirectory(), source_);
             PublishProxy(result);
             RefreshProcessesImpl(ProcessAnnounce::Never);
@@ -699,6 +706,7 @@ public:
 
     void LaunchAndAttach() {
         Queue(anomaly::MessageId::LauncherStatusLaunchingAttach, MessageScope::Attach, [this] {
+            StartTelemetryImpl();
             const auto launcher = LauncherExecutable();
             const auto selected = ResolveAttachRuntime();
             if (!selected.Ok()) {
@@ -762,6 +770,7 @@ public:
         if (process_id == 0) return;
         Queue(anomaly::MessageId::LauncherStatusInjectingProcess, MessageScope::Attach,
             [this, process_id] {
+            StartTelemetryImpl();
             const auto selected = ResolveAttachRuntime();
             if (!selected.Ok()) {
                 PublishRuntimeFailure(selected);
@@ -1224,6 +1233,27 @@ private:
             configuration_path_, configuration);
     }
 
+    void StartTelemetryImpl() noexcept {
+        try {
+            const auto day = anomaly::TelemetryDay(std::chrono::system_clock::now());
+            if (telemetry_attempt_day_ == day) return;
+            anomaly::TelemetryOptions options;
+            options.enabled = ue5mem::AnalyzerConfig::Load(LauncherSettingsPath()).telemetry_enabled;
+            if (!options.enabled) return;
+            const auto snapshot = Snapshot();
+            if (!snapshot.theme) return;
+            options.language = anomaly::LocaleName(anomaly::ResolveUserLocale(
+                anomaly::ParseLanguagePreference(snapshot.language).preference).locale);
+            anomaly::LauncherTelemetryUsage usage;
+            usage.theme = anomaly::ToString(snapshot.theme->palette);
+            usage.custom_background = anomaly::launcher::IsCustomLauncherBackground(
+                snapshot.theme->palette, snapshot.theme->layout.background.path, snapshot.theme->HasBackground());
+            telemetry_attempt_day_ = day;
+            telemetry_worker_ = std::jthread([options = std::move(options), usage = std::move(usage)](
+                std::stop_token stop) { anomaly::ReportLauncherUsage(options, usage, stop); });
+        } catch (...) {}
+    }
+
     void RefreshThemeImpl() {
         // The launcher reads the theme next to itself, exactly like its locales:
         // payload_root_ points at wherever the payload is installed, which is not
@@ -1325,6 +1355,8 @@ private:
     std::deque<Work> queue_;
     // Throttles PollProcesses: a per-frame caller must not turn into a per-frame process scan.
     std::chrono::steady_clock::time_point last_process_poll_{};
+    std::string telemetry_attempt_day_;
+    std::jthread telemetry_worker_;
     std::jthread worker_;
 };
 
@@ -2723,6 +2755,7 @@ struct LauncherModSettingsCache final {
     bool initialized{};
     bool compatibility{true};
     bool bypass{};
+    bool force_load{};
 };
 
 LauncherModSettingsCache& RefreshLauncherModSettings(
@@ -2743,9 +2776,11 @@ LauncherModSettingsCache& RefreshLauncherModSettings(
             ? *loaded_settings : LauncherPakSettings(snapshot);
         cache.compatibility = anomaly::PakModCompatibilityMode(settings);
         cache.bypass = settings.value("enabled", true);
+        cache.force_load = anomaly::PakModForceLoad(settings);
     } catch (...) {
         cache.compatibility = true;
         cache.bypass = false;
+        cache.force_load = false;
     }
     return cache;
 }
@@ -3205,6 +3240,15 @@ bool LauncherWriteBypassEnabled(const LauncherSnapshot& snapshot, const bool ena
     });
 }
 
+// The master bypass decides whether mods load at all; this decides what the exclusivity does with a
+// mod that ships the same resources as another one. Off by default: two variants of one body are a
+// mixture nobody asked for, while a patch mod next to the mod it patches is exactly the point.
+bool LauncherWriteForceLoad(const LauncherSnapshot& snapshot, const bool enabled) {
+    return LauncherWritePakSettings(snapshot, [enabled](auto& document) {
+        document["forceLoad"] = enabled;
+    });
+}
+
 bool LauncherSetModEnabled(const LauncherSnapshot& snapshot, const LauncherModEntry& entry,
     const bool enabled) {
     const auto key = LauncherModStateKey(entry);
@@ -3224,7 +3268,7 @@ bool LauncherSetModEnabled(const LauncherSnapshot& snapshot, const LauncherModEn
                 return anomaly::NormalizePakModKey(row.key) == anomaly::NormalizePakModKey(key);
             });
             if (selected == catalog.end()) return false;
-            if (enabled) {
+            if (enabled && !anomaly::PakModForceLoad(settings)) {
                 std::vector<LauncherModEntry> all;
                 LauncherRefreshMods(snapshot, all);
                 for (const auto& other : catalog) if (anomaly::PakModsConflict(*selected, other)) {
@@ -3405,8 +3449,9 @@ bool LauncherFinishModWrite(const LauncherSnapshot& snapshot, const LauncherModE
     const bool enable_after) {
     try {
         const bool compatibility = LauncherCompatibilityMode(snapshot);
-        if (compatibility && enable_after) {
-            const auto catalog = anomaly::ReadPakModCatalog(LauncherModsDirectory(snapshot), LauncherPakSettings(snapshot));
+        const auto settings = LauncherPakSettings(snapshot);
+        if (compatibility && enable_after && !anomaly::PakModForceLoad(settings)) {
+            const auto catalog = anomaly::ReadPakModCatalog(LauncherModsDirectory(snapshot), settings);
             const auto selected = std::find_if(catalog.begin(), catalog.end(), [&](const auto& row) {
                 return anomaly::NormalizePakModKey(row.key) == anomaly::NormalizePakModKey(LauncherModStateKey(target));
             });
@@ -5387,6 +5432,7 @@ void DrawModsMode(
         } catch (...) {
             mod_settings.compatibility = true;
             mod_settings.bypass = false;
+            mod_settings.force_load = false;
         }
         LauncherRefreshMods(snapshot, mods, &settings);
         for (auto& entry : mods) entry.selected = selected_names.count(LauncherModStateKey(entry)) != 0;
@@ -5424,6 +5470,24 @@ void DrawModsMode(
     if (LauncherChip(Text(translator, anomaly::MessageId::LauncherModsOrganize))) {
         import_message = LauncherOrganizeMessage(LauncherOrganizeModFolders(snapshot, mods));
         refresh_mods();
+    }
+    // The exclusivity of the mods page: a patch that ships the same body as the mod it patches is a
+    // conflict by resource, and this is how the player says "load both anyway". It sits with the
+    // page-wide commands rather than on a row, because it applies to the whole selection.
+    ImGui::SameLine();
+    {
+        bool force_load = mod_settings.force_load;
+        ImGui::BeginDisabled(snapshot.game_directory.empty());
+        if (anomaly::glass::Switch(Text(translator, anomaly::MessageId::LauncherModsForceLoad), &force_load)) {
+            if (LauncherWriteForceLoad(snapshot, force_load)) {
+                mod_settings.force_load = force_load;
+                import_message.clear();
+                refresh_mods();
+            } else {
+                import_message = Text(translator, anomaly::MessageId::SettingsSaveFailed);
+            }
+        }
+        ImGui::EndDisabled();
     }
     ImGui::SameLine();
     if (check_running) {

@@ -110,6 +110,22 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(minhook)
 
+# Portable BLAKE3 produces the FIoHash metadata for generated compatibility containers.
+FetchContent_Declare(
+    blake3
+    URL https://github.com/BLAKE3-team/BLAKE3/archive/refs/tags/1.3.1.zip
+    URL_HASH SHA256=7a417e3571cde3199cb709d4f732709172ceb35f1ff740e4564faf72a79330c4
+    DOWNLOAD_EXTRACT_TIMESTAMP TRUE
+)
+FetchContent_MakeAvailable(blake3)
+add_library(anomaly_blake3 STATIC
+    "${blake3_SOURCE_DIR}/c/blake3.c"
+    "${blake3_SOURCE_DIR}/c/blake3_dispatch.c"
+    "${blake3_SOURCE_DIR}/c/blake3_portable.c")
+target_include_directories(anomaly_blake3 PUBLIC "${blake3_SOURCE_DIR}/c")
+target_compile_definitions(anomaly_blake3 PRIVATE
+    BLAKE3_NO_SSE2 BLAKE3_NO_SSE41 BLAKE3_NO_AVX2 BLAKE3_NO_AVX512 BLAKE3_USE_NEON=0)
+
 set(JSON_BuildTests OFF)
 set(JSON_Install OFF)
 set(JSON_MultipleHeaders OFF)
@@ -491,6 +507,12 @@ target_compile_definitions(
 target_compile_options(anomaly_config PRIVATE /W4 /permissive- /EHsc)
 target_link_libraries(anomaly_config PUBLIC anomaly_i18n)
 
+add_library(anomaly_telemetry STATIC src/services/telemetry.cpp)
+target_include_directories(anomaly_telemetry PUBLIC include)
+target_compile_definitions(anomaly_telemetry PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+target_compile_options(anomaly_telemetry PRIVATE /W4 /permissive- /EHsc)
+target_link_libraries(anomaly_telemetry PRIVATE winhttp bcrypt shell32 ole32 nlohmann_json::nlohmann_json)
+
 add_library(anomaly_bootstrap_client STATIC src/bootstrap/bootstrap_client.cpp)
 target_include_directories(anomaly_bootstrap_client PUBLIC include)
 target_compile_definitions(
@@ -588,6 +610,7 @@ add_library(anomaly_adapter_services STATIC
     src/game/ue5/adapter_service_registry.cpp
     src/game/ue5/ue5_assets.cpp
     src/game/ue5/ue5_pak.cpp
+    src/game/ue5/ue5_mod_compatibility.cpp
     src/game/ue5/ue5_object_lookup.cpp
     src/game/ue5/ue5_process_event.cpp
     src/game/ue5/ue5_process_event_hook.cpp
@@ -605,7 +628,8 @@ target_compile_definitions(
 target_compile_options(anomaly_adapter_services PRIVATE /W4 /permissive- /EHsc /utf-8)
 target_link_libraries(
     anomaly_adapter_services
-    PUBLIC anomaly_symbol_resolver anomaly_hook_manager anomaly_minhook_backend anomaly_ue5_ftext)
+    PUBLIC anomaly_symbol_resolver anomaly_hook_manager anomaly_minhook_backend anomaly_ue5_ftext
+    PRIVATE anomaly_blake3 bcrypt)
 
 add_library(anomaly_websocket_server STATIC src/platform/windows/websocket_server.cpp)
 target_include_directories(anomaly_websocket_server PUBLIC include)
@@ -1044,6 +1068,8 @@ target_compile_options(anomaly_core PRIVATE /W4 /permissive- /EHsc)
 # function-local static guards. These targets initialize their process-scoped
 # local statics on the lifecycle thread before publishing concurrent services.
 set(ANOMALY_MANUAL_MAP_TLS_FREE_TARGETS
+    anomaly_telemetry
+    anomaly_blake3
     anomaly_pak_mod_catalog
     anomaly_core
     anomaly_i18n
@@ -1065,6 +1091,7 @@ foreach(target IN LISTS ANOMALY_MANUAL_MAP_TLS_FREE_TARGETS)
 endforeach()
 target_link_libraries(
     anomaly_core PRIVATE
+    anomaly_telemetry
     ue5mem_core anomaly_runtime_kernel anomaly_imgui anomaly_minhook_backend anomaly_ui_service
     anomaly_platform_ui_model
     anomaly_platform_settings
@@ -1254,6 +1281,7 @@ target_compile_definitions(
 target_compile_options(anomaly_launcher PRIVATE /W4 /permissive- /EHsc)
 target_link_options(anomaly_launcher PRIVATE /MANIFESTUAC:NO /DELAYLOAD:dwmapi.dll)
 target_link_libraries(anomaly_launcher PRIVATE
+    anomaly_telemetry
     anomaly_config anomaly_imgui anomaly_launcher_configuration anomaly_launcher_proxy
     anomaly_manual_map
     anomaly_platform_settings anomaly_platform_ui_layout
